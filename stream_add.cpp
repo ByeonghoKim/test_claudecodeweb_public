@@ -3,16 +3,16 @@
  *
  * Layout
  * ------
- *  VectorPair   – RAII struct holding two 64 MB float arrays
- *  StreamSource – input_iterator that yields VectorPairs one at a time
+ *  VectorPair   – RAII struct holding two 64 MB float arrays (64-byte aligned)
+ *  StreamSource – generates VectorPairs lazily (one at a time)
  *  timed_add()  – adds two vectors; timer wraps ONLY the add loop
  *  main()       – drives the stream, prints per-pair stats and a summary
  *
- * Build:
- *   g++ -O2 -std=c++17 -o stream_add stream_add.cpp
+ * ISA used: AVX-512F  (_mm512_add_ps — 16 floats per instruction)
+ * Fallback : scalar loop for any trailing elements (< 16)
  *
- * The -O2 flag lets the compiler vectorise the add loop (AVX/SSE) without
- * removing it, so the timing reflects realistic hardware throughput.
+ * Build:
+ *   g++ -O2 -std=c++17 -mavx512f -o stream_add stream_add.cpp
  */
 
 #include <chrono>
@@ -25,6 +25,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <immintrin.h>   // AVX-512 intrinsics
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,12 +36,31 @@ static constexpr std::size_t ELEMENTS        = VECTOR_BYTES / sizeof(float); // 
 static constexpr int         NUM_PAIRS       = 8;
 
 // ---------------------------------------------------------------------------
+// 0. Aligned allocator (64-byte alignment for AVX-512 loads/stores)
+// ---------------------------------------------------------------------------
+template<typename T, std::size_t Align = 64>
+struct AlignedAllocator {
+    using value_type = T;
+    T* allocate(std::size_t n) {
+        void* p = nullptr;
+        if (posix_memalign(&p, Align, n * sizeof(T)) != 0) throw std::bad_alloc{};
+        return static_cast<T*>(p);
+    }
+    void deallocate(T* p, std::size_t) { free(p); }
+    template<typename U> struct rebind { using other = AlignedAllocator<U, Align>; };
+    bool operator==(const AlignedAllocator&) const { return true; }
+    bool operator!=(const AlignedAllocator&) const { return false; }
+};
+
+using AlignedVec = std::vector<float, AlignedAllocator<float>>;
+
+// ---------------------------------------------------------------------------
 // 1. Data types
 // ---------------------------------------------------------------------------
 struct VectorPair {
-    int                 index;
-    std::vector<float>  a;
-    std::vector<float>  b;
+    int        index;
+    AlignedVec a;
+    AlignedVec b;
 };
 
 // ---------------------------------------------------------------------------
@@ -82,22 +102,36 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 3. Timed add — isolates *just* the addition loop
+// 3. Timed add — isolates *just* the addition loop (AVX-512)
 // ---------------------------------------------------------------------------
 struct AddResult {
-    std::vector<float>  result;
-    double              elapsed_sec;
+    AlignedVec  result;
+    double      elapsed_sec;
 };
 
-AddResult timed_add(const std::vector<float>& a, const std::vector<float>& b)
+AddResult timed_add(const AlignedVec& a, const AlignedVec& b)
 {
-    std::vector<float> result(a.size());
+    const std::size_t n       = a.size();
+    const std::size_t n16     = n & ~std::size_t{15};   // largest multiple of 16 <= n
+    AlignedVec result(n);
 
-    // ── just the add ──────────────────────────────────────────────────────
+    const float* __restrict__ pa = a.data();
+    const float* __restrict__ pb = b.data();
+    float*       __restrict__ pr = result.data();
+
+    // ── just the add (AVX-512: 16 floats / instruction) ───────────────────
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    for (std::size_t i = 0; i < a.size(); ++i)
-        result[i] = a[i] + b[i];
+    // Main AVX-512 loop — processes 16 floats per iteration
+    for (std::size_t i = 0; i < n16; i += 16) {
+        __m512 va = _mm512_load_ps(pa + i);   // aligned load (64-byte boundary)
+        __m512 vb = _mm512_load_ps(pb + i);
+        __m512 vc = _mm512_add_ps(va, vb);    // C = A + B  (16 floats at once)
+        _mm512_store_ps(pr + i, vc);           // aligned store
+    }
+    // Scalar tail for any remaining elements (< 16)
+    for (std::size_t i = n16; i < n; ++i)
+        pr[i] = pa[i] + pb[i];
 
     auto t1 = std::chrono::high_resolution_clock::now();
     // ──────────────────────────────────────────────────────────────────────
@@ -131,7 +165,7 @@ int main()
     auto dash62 = std::string(62, '-');
 
     std::cout << sep62 << "\n";
-    std::cout << "  Stream-add benchmark (C++)\n";
+    std::cout << "  Stream-add benchmark (C++ / AVX-512)\n";
     std::cout << "  Vector size : " << (VECTOR_BYTES / MB) << " MB"
               << "  (" << ELEMENTS << " float32 elements)\n";
     std::cout << "  Pairs       : " << NUM_PAIRS << "\n";
